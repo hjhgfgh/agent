@@ -142,33 +142,116 @@ READ_ONLY=true                 # 演示环境建议开，只允许提问
 
 ## 五、部署到服务器
 
-1. 装 Docker：
+> 以下步骤已在 **阿里云 ECS** 上实测通过：Alibaba Cloud Linux 3.2104 LTS、2 核 2 GiB、
+> 华南1（深圳）D、40 GiB ESSD、公网带宽按流量计费。
+
+### 1. 装 Docker
+
+系统是 RHEL 系（`dnf`），**不要**用 `get.docker.com` 一键脚本，按下面来：
 
 ```bash
-curl -fsSL https://get.docker.com | sh
+# Alibaba Cloud Linux 3 的 $releasever 是 "3"，而 docker-ce 仓库只有 7/8/9，
+# 不处理会直接 404。这里固定成 8（Anolis 8 / RHEL8 兼容）。
+dnf install -y dnf-plugins-core
+curl -fsSL -o /etc/yum.repos.d/docker-ce.repo \
+  https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+sed -i 's|\$releasever|8|g; s|download.docker.com|mirrors.aliyun.com/docker-ce|g' \
+  /etc/yum.repos.d/docker-ce.repo
+dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
 ```
 
-2. 拉代码（私有仓库先配好 SSH key 或访问令牌）：
+实测装到 Docker 26.1.3 + Compose v2.27.0。
+
+### 2. 配镜像加速器（**必做**）
+
+国内直连 Docker Hub 会超时 —— 首次没配加速器时，15 分钟只拉下来 29 MB，
+连接还落在 Cloudflare 的 CDN 上，约 30 KB/s。
 
 ```bash
+mkdir -p /etc/docker
+cat > /etc/docker/daemon.json <<'EOF'
+{
+  "registry-mirrors": [
+    "https://docker.m.daocloud.io",
+    "https://docker.1panel.live"
+  ],
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" },
+  "live-restore": true
+}
+EOF
+systemctl restart docker
+```
+
+加速器实测（拉 `alpine:latest` ≈3 MB）：
+
+| 加速器 | 耗时 |
+|--------|------|
+| `docker.m.daocloud.io` | **8 s** |
+| `docker.1panel.live` | **10 s** |
+| `docker.xuanyuan.me` | 26 s |
+| `docker.1ms.run` | 47 s |
+| `dockerpull.org` / `docker.1panel.top` | 失败 |
+
+换源后三个基础镜像（python 133 MB + redis 39 MB + mysql 799 MB）**2 分钟**拉完。
+
+> `log-opts` 那两行不是可有可无的：小磁盘机器上容器日志无限增长会把
+> 系统盘写满，进而整个 Docker 挂掉。
+
+### 3. 小内存机器加 swap
+
+2 GiB 内存构建时（pip 装依赖）有 OOM 风险，挂 2 GiB swap 兜底：
+
+```bash
+fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+echo 'vm.swappiness=10' >> /etc/sysctl.conf && sysctl -w vm.swappiness=10
+```
+
+实测运行期三容器合计约 570 MB，很宽裕；swap 在构建阶段做保险。
+
+### 4. 放代码 + 建配置
+
+```bash
+# 私有仓库先配好 SSH key 或访问令牌
 git clone <你的仓库地址> ai-tech-doc-assistant
 cd ai-tech-doc-assistant
 ```
 
-3. 创建 `backend/.env`（内容见第二节），**务必设置 `ACCESS_CODE`**。
-
-4. 想直接用 80 端口：
+创建 `backend/.env`（内容见第二节），**务必设置 `ACCESS_CODE`**；再建根目录 `.env`：
 
 ```bash
 echo "BACKEND_PORT=80" > .env
-docker compose up -d --build
+echo "MYSQL_ROOT_PASSWORD=$(openssl rand -hex 12)" >> .env
 ```
 
-5. 放行端口。云服务器要在**安全组**里放行，Ubuntu 还要过 ufw：
+### 5. 构建并启动
+
+ECS 上阿里云 pypi 走内网，实测 550 KB/s vs 清华 342 KB/s，所以构建时切阿里云源：
 
 ```bash
-ufw allow 80
+docker compose build \
+  --build-arg PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+  --build-arg PIP_TRUSTED_HOST=mirrors.aliyun.com
+docker compose up -d
 ```
+
+> `docker compose up` 本身不支持 `--build-arg`，所以必须分成 `build` + `up` 两步。
+
+### 6. 放行端口
+
+云服务器要在**安全组**里放行 80（入方向）；系统防火墙如果开着也要放：
+
+```bash
+# Alibaba Cloud Linux 3 / CentOS
+# firewall-cmd --permanent --add-port=80/tcp && firewall-cmd --reload
+# Ubuntu
+# ufw allow 80
+```
+
+**验证**：`curl http://<公网IP>/health` 应返回
+`{"status":"healthy","redis":true,"db":true}`。
 
 **安全提醒**：`docker-compose.yml` 刻意**没有**给 MySQL 和 Redis 做端口映射。
 它们是裸奔状态（Redis 无密码），映射到公网等于任人读写，这是最常见的入侵入口。

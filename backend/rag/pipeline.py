@@ -278,6 +278,20 @@ class SimpleVectorStore:
         scored.sort(key=lambda x: (-x[0], len(self.chunks[x[1]].page_content)))
         return [self.chunks[idx] for _, idx in scored[:k]]
 
+    def warmup(self) -> int:
+        """预热分词缓存，返回已缓存的切片数。
+
+        检索时每个切片都要做一次中英文混合分词（中文按 bigram 展开，开销不小）。
+        内置的 VueJS 文档有上千个切片，如果等到用户第一次提问才算，
+        这一轮检索要凭空多花一两秒 —— 用户感知为"第一次提问特别慢"，
+        之后却很快，很难归因。
+
+        在后台线程里提前算好，用户第一次提问就走热路径。
+        """
+        for idx in range(len(self.chunks)):
+            self._chunk_tokens(idx)
+        return len(self._token_cache)
+
     def fallback_context(self, limit: int = FALLBACK_CHUNKS) -> List[LCDocument]:
         """关键词检索命中 0 条时的兜底上下文：退回最近入库的若干切片。
 

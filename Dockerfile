@@ -38,9 +38,28 @@ WORKDIR /app
 # slim 镜像默认不带，缺失时 import faiss 会直接报
 #   ImportError: libgomp.so.1: cannot open shared object file
 # 这类错误在构建期不报、运行期才炸，必须在这里装掉。
-RUN apt-get update \
- && apt-get install -y --no-install-recommends libgomp1 tzdata \
- && rm -rf /var/lib/apt/lists/*
+# apt 走阿里云 Debian 镜像。直连 deb.debian.org 在国内服务器（尤其 ECS）
+# 经常只有几 KB/s 甚至超时，构建会卡死在这一层。
+#
+# 与上面的 pip 源不同：那里实测清华快 8 倍所以默认清华；apt 这边要的是
+# 「稳」——阿里云对 Debian 的同步最全、在国内 ECS 上还会自动走内网，
+# 是本项目部署环境下的稳妥选择。同样用 ARG 保留构建时覆盖能力：
+#   docker build --build-arg DEBIAN_MIRROR=mirrors.cloud.tencent.com -t ai-tech-doc-assistant .
+#
+# 刻意不写死发行版代号（trixie/bookworm）：
+# 只把域名替换掉，且同时兼容新版 deb822 格式
+# （/etc/apt/sources.list.d/debian.sources）和旧版 sources.list，
+# 以后换基础镜像版本也不用动这里。
+ARG DEBIAN_MIRROR=mirrors.aliyun.com
+RUN set -eux; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+        if [ -f "$f" ]; then \
+            sed -i "s|deb.debian.org|${DEBIAN_MIRROR}|g; s|security.debian.org|${DEBIAN_MIRROR}|g" "$f"; \
+        fi; \
+    done; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libgomp1 tzdata; \
+    rm -rf /var/lib/apt/lists/*
 
 # 依赖单独占一层：以后只改 Python 代码时，这一层直接命中缓存，
 # 不必每次重新装几分钟的依赖。

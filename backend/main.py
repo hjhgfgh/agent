@@ -4,6 +4,7 @@
 import os
 import uuid
 import time
+import asyncio
 import hashlib
 import secrets
 import sys
@@ -16,7 +17,7 @@ from contextlib import asynccontextmanager
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Query, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -60,6 +61,22 @@ UPLOAD_DIR = os.path.join(BASE_DIR, "documents")
 INDEX_DIR = os.path.join(BASE_DIR, "faiss_index")
 FRONTEND_DIR = os.path.normpath(os.path.join(BASE_DIR, "..", "frontend"))
 
+# ===== 内置文档（常驻知识库）=====
+# 刻意放在镜像内的独立目录，而不是 UPLOAD_DIR：
+#   UPLOAD_DIR 挂的是 upload_data 卷，服务器首次部署时是空的，
+#   内置文档若放那里，"开箱即有内容可问"就无从谈起。
+# 镜像内的文件不随卷清空而消失，换台服务器重新部署也一定在。
+BUILTIN_DIR = os.path.join(BASE_DIR, "builtin_docs")
+
+# 内置文档在界面/检索来源里显示的名字。
+# 磁盘文件名之所以用纯英文：容器的 locale 未设置时，Python 的文件系统编码
+# 可能回退成 ASCII，中文文件名在 os.listdir / open 时会直接抛错，
+# 而这个错误只在 Linux 容器里出现，本地 Windows 开发完全复现不了。
+# 显示名走数据库字段，不受这个限制。
+BUILTIN_DISPLAY_NAMES = {
+    "vuejs-official-guide.pdf": "VueJS官方文档.pdf",
+}
+
 # ===== 访问控制配置（公网部署必读）=====
 # ACCESS_CODE 为空 = 完全不鉴权，任何拿到链接的人都能直接调 /chat 消耗你的
 # 大模型额度。本地开发图省事可以留空，部署到服务器时务必设置。
@@ -76,6 +93,98 @@ vector_store.load()
 rag_pipeline = RAGPipeline(vector_store)
 redis_cache = RedisCache()
 llm_client = LLMClient()
+
+# 后台任务的强引用容器。
+# asyncio 对 create_task 的返回值只持弱引用，不自己留一份的话，
+# 任务可能在跑完之前被垃圾回收 —— 表现为"内置文档偶发没索引上"，
+# 而且因为没有任何异常，日志里一片安静，极难排查。
+_background_tasks: set = set()
+
+
+def _ensure_builtin_record(file_hash: str, stored_name: str,
+                           display_name: str, chunks: Optional[List] = None) -> int:
+    """确保内置文档在数据库里有一条 is_builtin=True 的记录（幂等）。
+
+    分两处判断的原因：chunks.json 与数据库是两份独立存储，
+    任何一边被单独清掉（例如只删了卷里的索引、没清库），
+    另一边都要能自愈，否则会长期停留在"索引里有、列表里没有"的错位状态。
+    """
+    with db_session() as db:
+        existing = db.query(Document).filter(
+            Document.filename == stored_name,
+            Document.is_builtin.is_(True),
+        ).first()
+        if existing:
+            return existing.id
+
+        preview_text = ""
+        if chunks:
+            preview_text = doc_processor.extract_text_preview(chunks[0].page_content)
+
+        doc = Document(
+            filename=stored_name,
+            original_name=display_name,
+            content_preview=preview_text,
+            chunk_count=len(chunks) if chunks else 0,
+            is_builtin=True,
+            client_id=None,      # 内置文档不属于任何访客会话，永远不会被回收
+        )
+        db.add(doc)
+        db.commit()
+        db.refresh(doc)
+        print(f"[BUILTIN] 已登记数据库记录: {display_name} (ID: {doc.id})")
+        return doc.id
+
+
+def _index_builtin_documents() -> None:
+    """把随镜像发布的内置文档索引进知识库（幂等，可重复执行）。
+
+    幂等靠内容哈希判断：chunks.json 里已收录该文件就跳过解析，
+    所以每次容器重启都跑一遍也不会重复切分、不会重复累加切片。
+    """
+    if not os.path.isdir(BUILTIN_DIR):
+        print(f"[BUILTIN] 未找到内置文档目录，跳过: {BUILTIN_DIR}")
+        return
+
+    try:
+        names = sorted(
+            n for n in os.listdir(BUILTIN_DIR) if n.lower().endswith(".pdf")
+        )
+    except OSError as e:
+        print(f"[ERROR] 内置文档目录读取失败: {e}")
+        return
+
+    if not names:
+        print(f"[BUILTIN] 内置文档目录为空，跳过: {BUILTIN_DIR}")
+        return
+
+    for name in names:
+        path = os.path.join(BUILTIN_DIR, name)
+        display_name = BUILTIN_DISPLAY_NAMES.get(name, name)
+        try:
+            file_hash = compute_file_hash(path)
+
+            if vector_store.has_file(file_hash):
+                print(f"[BUILTIN] 索引已存在，跳过解析: {display_name}")
+                _ensure_builtin_record(file_hash, name, display_name)
+                continue
+
+            print(f"[BUILTIN] 首次索引: {display_name}")
+            chunks = doc_processor.get_chunks_from_pdf(path, file_hash, display_name)
+            added = vector_store.add_documents(chunks)
+            _ensure_builtin_record(file_hash, name, display_name, chunks)
+            print(f"[BUILTIN] 完成: {display_name}，新增 {added} 个切片")
+        except Exception as e:
+            # 单个内置文档失败不能拖垮其余文档，更不能影响服务本身
+            print(f"[ERROR] 内置文档索引失败 {name}: {e}")
+            traceback.print_exc()
+
+    # 预热分词缓存，避免用户第一次提问时才开始算上千个切片的分词
+    try:
+        cached = vector_store.warmup()
+        print(f"[BUILTIN] 检索缓存预热完成（{cached} 个切片）")
+    except Exception as e:
+        print(f"[WARN] 检索缓存预热失败: {e}")
 
 
 @asynccontextmanager
@@ -99,6 +208,19 @@ async def lifespan(app: FastAPI):
         print("[OK] Redis连接正常")
     else:
         print("[ERROR] Redis连接失败，部分功能受限")
+
+    # 索引内置文档（VueJS 官方文档等常驻知识库）。
+    #
+    # 放后台线程的两个理由：
+    #   1. 不能同步等 —— 首次要解析 2MB 的 PDF、切出上千个切片再全量写盘，
+    #      会把启动卡住，容器的健康检查（start-period 20s）跟着超时，
+    #      结果是容器被判定为不健康而反复重启。
+    #   2. 也不能直接在事件循环里做 —— PyMuPDF 解析和分词都是 CPU 密集的
+    #      同步操作，会把整个事件循环堵死，期间的请求全部排队。
+    # 索引完成后前端刷新即可看到内容，服务本身不为它等待。
+    task = asyncio.create_task(asyncio.to_thread(_index_builtin_documents))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     # 访问控制状态：漏配 ACCESS_CODE 是公网部署最常见也最贵的事故，
     # 启动时必须显式打出来，避免"以为设了、其实没生效"。
@@ -186,9 +308,14 @@ async def access_guard(request: Request, call_next):
     ):
         return JSONResponse(status_code=401, content={"detail": "访问口令无效，请重新输入"})
 
-    # 只读模式：拒绝一切写操作，但 /chat 例外 ——
-    # 提问对知识库而言是纯读取，也正是访客唯一该被允许做的事。
-    if READ_ONLY and request.method in ("POST", "PUT", "PATCH", "DELETE") and path != "/chat":
+    # 只读模式：拒绝一切写操作，但两个例外 ——
+    #   /chat             提问对知识库而言是纯读取，正是访客唯一该被允许做的事；
+    #   /session/cleanup  清理临时文档是"把环境恢复成初始状态"，
+    #                     它只会让知识库更干净，与只读的初衷不冲突；
+    #                     若一并拦掉，页面每次打开都会留下一条 403，
+    #                     控制台看着像报错，且残留的临时文档再也清不掉。
+    if READ_ONLY and request.method in ("POST", "PUT", "PATCH", "DELETE") \
+            and path not in ("/chat", "/session/cleanup"):
         return JSONResponse(
             status_code=403,
             content={"detail": "演示环境为只读模式，不支持上传或删除文档"},
@@ -267,7 +394,8 @@ def _write_file(path: str, content: bytes) -> None:
         f.write(content)
 
 
-def _save_document_record(stored_name: str, original_name: str, chunks: List) -> int:
+def _save_document_record(stored_name: str, original_name: str, chunks: List,
+                          client_id: Optional[str] = None) -> int:
     """同步写入文档记录（供线程池调用）"""
     with db_session() as db:
         preview_text = ""
@@ -278,6 +406,8 @@ def _save_document_record(stored_name: str, original_name: str, chunks: List) ->
             original_name=original_name,
             content_preview=preview_text,
             chunk_count=len(chunks),
+            is_builtin=False,
+            client_id=client_id,
         )
         db.add(doc)
         db.commit()
@@ -285,9 +415,24 @@ def _save_document_record(stored_name: str, original_name: str, chunks: List) ->
         return doc.id
 
 
+def _clean_client_id(raw: Optional[str]) -> Optional[str]:
+    """规整前端传来的会话标识。
+
+    这是唯一由客户端自由填写的字段，且会写进数据库与日志，
+    必须限长 + 剔除非预期字符，避免有人塞进超长串或控制字符。
+    """
+    value = (raw or "").strip()
+    if not value:
+        return None
+    return "".join(ch for ch in value if ch.isalnum() or ch in "_-")[:64] or None
+
+
 @app.post("/upload")
-async def upload_document(file: UploadFile = File(...)):
-    """上传技术文档PDF
+async def upload_document(
+    file: UploadFile = File(...),
+    client_id: Optional[str] = Form(None),
+):
+    """上传技术文档PDF（访客上传的属"临时文档"，关掉网页后会被回收）
 
     优化点：
     - 内容哈希去重：同一份文档重复上传直接秒返回，不再重复解析
@@ -296,6 +441,8 @@ async def upload_document(file: UploadFile = File(...)):
     """
     if not (file.filename or "").lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="只支持PDF格式的文件")
+
+    client_id = _clean_client_id(client_id)
 
     started = time.time()
     try:
@@ -340,7 +487,7 @@ async def upload_document(file: UploadFile = File(...)):
         document_id = 0
         try:
             document_id = await run_in_threadpool(
-                _save_document_record, stored_name, original_name, chunks
+                _save_document_record, stored_name, original_name, chunks, client_id
             )
             print(f"[UPLOAD] 数据库记录已保存 (ID: {document_id})")
         except Exception as db_error:
@@ -380,10 +527,14 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.get("/documents")
 async def list_documents():
-    """获取已上传的文档列表"""
+    """获取知识库文档列表（内置文档在前，临时文档按上传时间倒序）"""
     try:
         with db_session() as db:
-            docs = db.query(Document).order_by(Document.created_at.desc()).all()
+            # 内置文档排最前：它是知识库的主体，也是唯一常驻的内容，
+            # 访客的临时上传应该排在它后面，视觉上就分出主次。
+            docs = db.query(Document).order_by(
+                Document.is_builtin.desc(), Document.created_at.desc()
+            ).all()
             result = []
             for d in docs:
                 result.append({
@@ -391,6 +542,7 @@ async def list_documents():
                     "filename": d.filename,
                     "original_name": d.original_name,
                     "chunk_count": d.chunk_count,
+                    "is_builtin": bool(d.is_builtin),
                     "created_at": str(d.created_at)
                 })
             return result
@@ -414,6 +566,39 @@ def _clear_qa_cache() -> int:
     return redis_cache.clear_qa_cache()
 
 
+async def _remove_document_payload(stored_name: str, original_name: str) -> int:
+    """清理单个文档在「向量库 + 磁盘」里的痕迹，返回清理掉的切片数。
+
+    数据库记录由调用方负责删除。这里刻意只做"重活"，
+    让「删单个文档」和「批量清理临时文档」复用同一段逻辑 ——
+    两条路径各写一遍的话迟早会跑偏，少清一处就会留下
+    "列表里已经没有了、提问却还能检索到"的鬼数据。
+    """
+    file_path = os.path.join(UPLOAD_DIR, stored_name)
+    removed = 0
+
+    # 1) 优先按内容哈希清理：最准确
+    if os.path.exists(file_path):
+        file_hash = await run_in_threadpool(compute_file_hash, file_path)
+        removed = await run_in_threadpool(
+            vector_store.remove_by_file_hash, file_hash
+        )
+
+    # 2) 兜底：按来源文件名清理。
+    #    覆盖两种哈希清不掉的情况：缺少 file_hash 元数据的旧索引，
+    #    以及磁盘文件已丢失、只剩数据库记录的场景。
+    if removed == 0 and original_name:
+        removed = await run_in_threadpool(
+            vector_store.remove_by_source, original_name
+        )
+
+    # 3) 清理磁盘文件
+    if os.path.exists(file_path):
+        await run_in_threadpool(os.remove, file_path)
+
+    return removed
+
+
 @app.delete("/documents/{doc_id}", response_model=DocumentDeleteResult)
 async def delete_document(doc_id: int):
     """删除文档：同步清理向量库切片、磁盘文件与失效的问答缓存"""
@@ -423,35 +608,25 @@ async def delete_document(doc_id: int):
             doc = db.query(Document).filter(Document.id == doc_id).first()
             if not doc:
                 raise HTTPException(status_code=404, detail="文档不存在")
+            # 内置文档是常驻知识库，前端不渲染它的删除按钮；
+            # 但接口这里必须自己也拦一道 —— 前端限制只是体验，不是防线。
+            if doc.is_builtin:
+                raise HTTPException(
+                    status_code=403,
+                    detail="内置文档由系统提供，不支持删除",
+                )
             stored_name = doc.filename
             original_name = doc.original_name
 
-        file_path = os.path.join(UPLOAD_DIR, stored_name)
-        removed = 0
+        # 2) 清理向量库与磁盘文件
+        removed = await _remove_document_payload(stored_name, original_name)
 
-        # 2) 清理向量库：优先按内容哈希（最准确）
-        if os.path.exists(file_path):
-            file_hash = await run_in_threadpool(compute_file_hash, file_path)
-            removed = await run_in_threadpool(
-                vector_store.remove_by_file_hash, file_hash
-            )
-
-        # 3) 兜底：按来源文件名清理（兼容缺少 file_hash 元数据的旧索引）
-        if removed == 0 and original_name:
-            removed = await run_in_threadpool(
-                vector_store.remove_by_source, original_name
-            )
-
-        # 4) 清理磁盘文件
-        if os.path.exists(file_path):
-            await run_in_threadpool(os.remove, file_path)
-
-        # 5) 删除数据库记录
+        # 3) 删除数据库记录
         with db_session() as db:
             db.query(Document).filter(Document.id == doc_id).delete()
             db.commit()
 
-        # 6) 让引用了该文档的问答缓存失效
+        # 4) 让引用了该文档的问答缓存失效
         invalidated = await run_in_threadpool(_clear_qa_cache)
 
         print(
@@ -469,6 +644,68 @@ async def delete_document(doc_id: int):
         print(f"[ERROR] 删除文档失败: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"删除文档失败: {str(e)}")
+
+
+class SessionCleanupResult(BaseModel):
+    message: str
+    removed_documents: int = 0
+    removed_chunks: int = 0
+    invalidated_cache: int = 0
+
+
+@app.post("/session/cleanup", response_model=SessionCleanupResult)
+async def cleanup_temporary_documents():
+    """清空全部访客上传的临时文档（内置文档不受影响）。
+
+    这是"使用者上传的文档，关掉网页后不再保存"的落地点。
+    调用时机由前端掌握：只有当页面是【新打开】而非【刷新】时才调，
+    靠 sessionStorage 里还有没有 client_id 来区分
+    （刷新它还在，关掉标签页它就没了）。
+
+    于是最终效果正好是：刷新页面保留已传文档，关掉网页后再打开才清空。
+
+    取舍说明：这里清的是【所有】临时文档，不做 client 级别的精确隔离。
+    代价是同时开两个标签页时，后打开的那个会把前一个刚传的文档清掉。
+    在"知识库以内置文档为主、上传只是临时试用"的定位下，
+    这个代价换来的是一个永远不会残留脏数据的、能一句话讲清楚的模型，
+    比引入会话心跳与孤儿回收划算得多。
+    """
+    try:
+        # 1) 先取快照并立刻释放数据库连接（后面有多次 await）
+        with db_session() as db:
+            docs = db.query(Document).filter(Document.is_builtin.is_(False)).all()
+            targets = [(d.filename, d.original_name) for d in docs]
+
+        if not targets:
+            return SessionCleanupResult(message="没有需要清理的临时文档")
+
+        # 2) 逐个清理向量库切片与磁盘文件
+        removed_chunks = 0
+        for stored_name, original_name in targets:
+            removed_chunks += await _remove_document_payload(stored_name, original_name)
+
+        # 3) 删除数据库记录
+        with db_session() as db:
+            db.query(Document).filter(Document.is_builtin.is_(False)).delete()
+            db.commit()
+
+        # 4) 被清掉的文档影响了检索结果，问答缓存必须一起失效
+        invalidated = await run_in_threadpool(_clear_qa_cache)
+
+        print(
+            f"[CLEANUP] 清理临时文档 {len(targets)} 份，"
+            f"切片 {removed_chunks}，失效缓存 {invalidated}"
+        )
+        return SessionCleanupResult(
+            message="临时文档已清理",
+            removed_documents=len(targets),
+            removed_chunks=removed_chunks,
+            invalidated_cache=invalidated,
+        )
+    except Exception as e:
+        print(f"[ERROR] 清理临时文档失败: {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"清理临时文档失败: {str(e)}")
 
 
 @app.post("/chat", response_model=ChatResponse)

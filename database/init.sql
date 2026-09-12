@@ -12,6 +12,12 @@ COLLATE utf8mb4_unicode_ci;
 USE tech_doc_assistant;
 
 -- 2. 文档表
+-- 文档分两类，靠 is_builtin 区分生命周期：
+--   内置文档（1）：随镜像发布，常驻知识库，接口层拒绝删除
+--   临时文档（0）：访客上传，关掉网页后下次打开页面时被自动回收
+-- 注：这两列是后加的。init.sql 只在数据卷首次初始化时执行一次，
+--     因此老库升级靠后端启动时的 models._ensure_columns() 自动补列，
+--     而不是重跑本脚本（那样会把已有数据 DROP 掉）。
 DROP TABLE IF EXISTS documents;
 CREATE TABLE documents (
     id INT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
@@ -19,8 +25,12 @@ CREATE TABLE documents (
     original_name VARCHAR(255) NOT NULL COMMENT '原始文件名',
     content_preview TEXT COMMENT '内容预览',
     chunk_count INT DEFAULT 0 COMMENT '切片数量',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间'
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='已上传的技术文档';
+    is_builtin TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否内置文档：1=随镜像发布、常驻且不可删除',
+    client_id VARCHAR(64) NULL COMMENT '上传者的浏览器会话标识，内置文档为 NULL',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    INDEX idx_client_id (client_id),
+    INDEX idx_is_builtin (is_builtin)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='知识库文档（内置 + 访客临时上传）';
 
 -- 3. 对话历史表
 DROP TABLE IF EXISTS conversations;

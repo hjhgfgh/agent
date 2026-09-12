@@ -120,6 +120,49 @@
             margin-top: 4px;
         }
 
+        /* 文档类型标签：内置 = 常驻知识库；临时 = 仅本次会话有效 */
+        .doc-badge {
+            display: inline-block;
+            padding: 1px 6px;
+            margin-right: 4px;
+            border-radius: 4px;
+            font-size: 10.5px;
+            line-height: 1.6;
+            vertical-align: middle;
+        }
+
+        .doc-badge.builtin {
+            color: #00d4ff;
+            background: rgba(0, 212, 255, 0.15);
+            border: 1px solid rgba(0, 212, 255, 0.4);
+        }
+
+        .doc-badge.temp {
+            color: #b388ff;
+            background: rgba(179, 136, 255, 0.14);
+            border: 1px solid rgba(179, 136, 255, 0.35);
+        }
+
+        /* 侧边栏底部说明：讲清临时文档的生命周期 */
+        .doc-tip {
+            display: flex;
+            align-items: flex-start;
+            gap: 6px;
+            margin-top: 14px;
+            padding-top: 12px;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+            font-size: 11.5px;
+            line-height: 1.6;
+            color: #666;
+        }
+
+        .doc-tip i {
+            color: #00d4ff;
+            font-size: 14px;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
         /* 删除按钮：默认隐藏，悬停文档时出现，避免列表视觉噪音 */
         .doc-delete-btn {
             width: 26px;
@@ -604,7 +647,7 @@
 
                 <!-- 文档列表 -->
                 <div class="doc-list">
-                    <div style="font-size: 12px; color: #666; margin-bottom: 10px;">已上传文档</div>
+                    <div style="font-size: 12px; color: #666; margin-bottom: 10px;">知识库文档</div>
                     <div v-if="notice" class="doc-notice">
                         <i class="mdi mdi-check-circle-outline"></i> {{ notice }}
                     </div>
@@ -618,10 +661,16 @@
                             <div class="doc-name" :title="doc.original_name || doc.filename">
                                 {{ doc.original_name || doc.filename }}
                             </div>
-                            <div class="doc-chunks">{{ doc.chunk_count }} 个切片</div>
+                            <div class="doc-chunks">
+                                <span class="doc-badge" :class="doc.is_builtin ? 'builtin' : 'temp'">
+                                    {{ doc.is_builtin ? '内置' : '临时' }}
+                                </span>{{ doc.chunk_count }} 个切片
+                            </div>
                         </div>
+                        <!-- 内置文档不渲染删除按钮：它是常驻知识库，
+                             误删一次整库就空了。后端也会再拦一道。 -->
                         <button
-                            v-if="!readOnly"
+                            v-if="!readOnly && !doc.is_builtin"
                             class="doc-delete-btn"
                             title="删除该文档"
                             :disabled="deletingId === doc.id"
@@ -632,6 +681,12 @@
                     </div>
                     <div v-if="documents.length === 0" style="color: #555; font-size: 13px; text-align: center; padding: 20px;">
                         暂无文档
+                    </div>
+
+                    <!-- 明确告知生命周期：否则用户会以为上传的东西被永久保存了 -->
+                    <div v-if="!readOnly" class="doc-tip">
+                        <i class="mdi mdi-information-outline"></i>
+                        <span>标记为「临时」的文档只在本次访问有效，关掉网页后会自动清空。</span>
                     </div>
                 </div>
             </div>
@@ -656,8 +711,12 @@
                     <!-- 欢迎状态 -->
                     <div v-if="messages.length === 0" class="empty-state">
                         <i class="mdi mdi-comment-text-outline"></i>
-                        <div class="welcome-text">上传技术文档后，开始提问吧！</div>
-                        <div class="hint-text">支持 Vue、React、FastAPI 等技术文档的问答</div>
+                        <div class="welcome-text">知识库已内置 VueJS 官方文档，直接提问即可</div>
+                        <div class="hint-text">
+                            {{ readOnly
+                                ? '可以询问 Vue 相关的任何问题'
+                                : '也可以上传自己的 PDF 一起提问，上传的文档仅本次访问有效' }}
+                        </div>
                     </div>
 
                     <!-- 消息列表 -->
@@ -773,6 +832,7 @@
                 const deletingId = ref(null);   // 正在删除的文档 id，用于禁用按钮、防重复提交
                 const notice = ref('');         // 文档列表上方的轻提示
                 const sessionId = ref('session_' + Date.now());
+                const clientId = ref('');       // 浏览器会话标识，用于区分"新打开"与"刷新"
                 const messagesContainer = ref(null);
 
                 // ===== 访问口令 / 只读模式状态 =====
@@ -844,6 +904,7 @@
                     if (ok) {
                         localStorage.setItem(ACCESS_CODE_KEY, code);
                         ready.value = true;
+                        await ensureSession();
                         await loadDocuments();
                     } else {
                         // 口令错了就清掉本地缓存，避免带着错口令继续请求
@@ -893,6 +954,59 @@
                             messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
                         }
                     });
+                };
+
+                // ===== 临时文档的会话标识 =====
+                //
+                // sessionStorage 的生命周期恰好就是"这一个标签页"：
+                //   刷新页面 —— 它还在，说明用户没走，已上传的临时文档要保留；
+                //   关掉标签页 —— 它消失了，下次打开即视为新会话，清掉上一次遗留的。
+                //
+                // 用它来区分这两种情况，比监听 beforeunload 去发清理请求可靠得多：
+                // 页面关闭时浏览器会直接掐断未完成的请求，而"下次打开时清理"
+                // 只依赖一次正常的页面加载，永远不会漏。
+                const CLIENT_ID_KEY = 'doc_assistant_client_id';
+
+                const readStoredClientId = () => {
+                    try {
+                        return sessionStorage.getItem(CLIENT_ID_KEY);
+                    } catch (e) {
+                        // 隐私模式或禁用存储时 sessionStorage 会直接抛异常。
+                        // 降级为"每次都当新会话"：功能照常可用，代价是刷新也会清空。
+                        return null;
+                    }
+                };
+
+                const ensureSession = async () => {
+                    const existing = readStoredClientId();
+                    if (existing) {
+                        clientId.value = existing;
+                        return existing;              // 刷新：沿用原会话，不清理
+                    }
+
+                    const fresh = 'c' + Date.now() + Math.random().toString(36).slice(2, 8);
+                    try {
+                        sessionStorage.setItem(CLIENT_ID_KEY, fresh);
+                    } catch (e) { /* 存不下也不影响本次使用 */ }
+                    clientId.value = fresh;
+
+                    // 新会话：回收上一次浏览遗留的临时文档（内置文档不受影响）
+                    try {
+                        const res = await fetchWithTimeout(
+                            `${API_BASE}/session/cleanup`, { method: 'POST' }, 30000
+                        );
+                        if (res.ok) {
+                            const data = await res.json();
+                            if (data.removed_documents) {
+                                console.log(`已清理上次访问遗留的临时文档 ${data.removed_documents} 份`);
+                            }
+                        }
+                    } catch (err) {
+                        // 清理失败不能挡住用户使用：残留的文档不影响提问，
+                        // 下次打开页面还会再试一次。
+                        console.error('清理临时文档失败:', err);
+                    }
+                    return fresh;
                 };
 
                 // 获取文档列表
@@ -976,6 +1090,8 @@
                     const startedAt = Date.now();
                     const formData = new FormData();
                     formData.append('file', file);
+                    // 带上会话标识，后端据此把这份文档记为"临时文档"
+                    formData.append('client_id', clientId.value || '');
 
                     try {
                         const res = await fetchWithTimeout(`${API_BASE}/upload`, {
@@ -1110,6 +1226,10 @@
                     const ok = await checkAccess(false);
                     if (ok) {
                         ready.value = true;
+                        // 必须先做会话判定：若是"新打开"，这里会清掉上次遗留的
+                        // 临时文档，随后 loadDocuments() 拿到的才是清理后的列表，
+                        // 否则用户会看到已经失效的文档（点删除还会 404）。
+                        await ensureSession();
                         await loadDocuments();
                     } else {
                         openGate('');
