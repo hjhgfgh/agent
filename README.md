@@ -10,8 +10,9 @@
 | 层次 | 实际使用 | 说明 |
 |------|---------|------|
 | 后端框架 | FastAPI + Uvicorn 0.34 | |
-| 大模型 | agnes-3.0-flash（OpenAI 兼容接口） | 换服务只需改 `LLM_BASE_URL` / `LLM_MODEL` |
-| 工具调用 | LangChain（Function Calling） | Agent 自主决定是否调用工具 |
+| 大模型 | agnes-2.5-flash（OpenAI 兼容接口） | 换服务只需改 `LLM_BASE_URL` / `LLM_MODEL` |
+| PDF 解析 / 切片 | PyMuPDF 为主，LangChain `PyPDFLoader` 降级兜底；切片用 `RecursiveCharacterTextSplitter` | 见 `rag/pipeline.py` |
+| 工具调用 | **OpenAI 原生 Function Calling**（自研 `to_openai_tools` 转换） | 不经 LangChain Agent；Agent 自主决定是否调用工具 |
 | 检索 | **自研关键词检索**（`SimpleVectorStore`） | 中文 bigram 切分 + 重叠度打分，**不使用 Embedding 模型** |
 | 会话 / 缓存 | Redis 7 | 多轮对话历史 + 问答结果缓存 |
 | 数据库 | MySQL 8 + SQLAlchemy 2 | 文档元数据、会话、缓存记录 |
@@ -41,15 +42,15 @@ Docker Desktop（Windows / macOS）或 Docker Engine + Compose（Linux）。
 
 ### 1. 配置
 
-根目录 `backend/.env` 是**唯一的应用配置来源**（本地与 Docker 共用同一份）：
+`backend/.env` 是**唯一的应用配置来源**（本地与 Docker 共用同一份）：
 
 ```env
 # --- 大模型 ---
 LLM_API_KEY=你的密钥
 LLM_BASE_URL=https://apihub.agnes-ai.cn/v1
-LLM_MODEL=agnes-3.0-flash
-LLM_TIMEOUT=60
-LLM_MAX_TOKENS=2000
+LLM_MODEL=agnes-2.5-flash
+LLM_TIMEOUT=120
+LLM_MAX_TOKENS=4000
 
 # --- 数据库 / 缓存（本地开发填 localhost）---
 DATABASE_URL=mysql+pymysql://root:123456@localhost:3306/tech_doc_assistant
@@ -113,7 +114,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ```env
 ACCESS_CODE=your-secret-code   # 不设 = 任何人拿到地址都能调 /chat 烧你的额度
-READ_ONLY=true                 # 演示环境建议开，只允许提问
+READ_ONLY=true                 # 演示环境建议开：只放行 /chat 与 /session/cleanup
 ```
 
 改完重启：`docker compose up -d --build backend`
@@ -265,14 +266,20 @@ docker compose up -d
 |------|------|:----:|------|
 | GET | `/health` | 免 | 健康检查（真实探测 MySQL + Redis） |
 | GET | `/auth/verify` | 需 | 校验口令，返回 `{ok, auth_required, read_only}` |
-| POST | `/upload` | 需 | 上传 PDF，切片并建索引 |
-| GET | `/documents` | 需 | 文档列表 |
-| DELETE | `/documents/{doc_id}` | 需 | 删除文档 |
-| POST | `/chat` | 需 | 问答（只读模式下唯一允许的写方法） |
+| POST | `/upload` | 需 | 上传 PDF，切片并建索引（只读模式返回 `403`） |
+| GET | `/documents` | 需 | 文档列表（内置文档在前） |
+| DELETE | `/documents/{doc_id}` | 需 | 删除文档（内置文档返回 `403`，只读模式全部 `403`） |
+| POST | `/session/cleanup` | 需 | 清空访客上传的临时文档，内置文档不受影响 |
+| POST | `/chat` | 需 | 问答（只读模式放行的两个写方法之一） |
 | GET | `/chat/history/{session_id}` | 需 | 会话历史 |
 | GET | `/tools` | 需 | 可用工具列表 |
 | GET | `/stats` | 需 | 系统统计 |
 | GET | `/api` | 免 | 服务信息 |
+
+> **只读模式（`READ_ONLY=true`）放行的写方法只有两个**：`/chat` 与 `/session/cleanup`。
+> 前者是访客唯一该被允许做的事；后者是"把环境恢复成初始状态"，只会让知识库更干净 ——
+> 若一并拦掉，页面每次打开都会留一条 403，且残留的临时文档再也清不掉。
+> `POST /upload`、`DELETE /documents/{id}` 一律返回 `403`。
 
 交互式文档：<http://localhost:8000/docs>
 
@@ -285,22 +292,57 @@ ai-tech-doc-assistant/
 ├── Dockerfile                  # 后端镜像（含前端静态文件）
 ├── docker-compose.yml          # 后端 + MySQL + Redis 编排
 ├── .dockerignore / .gitignore / .gitattributes
+├── README.md
+├── run_backend.py              # 本地启动脚本（绕开 Windows 下 --reload 的端口占用）
 ├── backend/
 │   ├── main.py                 # FastAPI 主应用 + 访问守卫中间件
 │   ├── requirements.txt
 │   ├── .env                    # 配置（已被 git 忽略，需自行创建）
+│   ├── builtin_docs/           # 内置文档：随镜像发布、常驻知识库（见下方说明）
+│   │   └── vuejs-official-guide.pdf
 │   ├── rag/pipeline.py         # RAG 核心：PDF 解析、切片、关键词检索
 │   ├── agent/agent.py          # Function Calling 与 4 个工具
 │   ├── cache/redis_cache.py    # 会话历史 + 问答缓存
 │   ├── database/models.py      # SQLAlchemy 模型
 │   ├── llm/client.py           # 大模型客户端（OpenAI 兼容）
-│   ├── documents/              # 上传的 PDF（运行时数据，不入仓库）
-│   └── faiss_index/            # 索引存储（运行时数据，不入仓库）
+│   ├── documents/              # 访客上传的 PDF（运行时数据，走 upload_data 卷）
+│   └── faiss_index/            # 索引存储（运行时数据，走 faiss_data 卷）
 ├── frontend/
 │   ├── index.html              # Vue 3 单页应用
-│   └── vendor/                 # 前端依赖本地化
-└── database/init.sql           # 建表脚本（首次启动自动执行）
+│   └── vendor/                 # 前端依赖本地化（vue / marked / dompurify / mdi）
+├── database/init.sql           # 建表脚本（首次启动自动执行）
+└── documents/                  # 原始素材（不入仓库、不进镜像）
 ```
+
+### 内置文档 vs 临时文档
+
+`backend/builtin_docs/` 里的 PDF 是**随镜像发布**的常驻知识库，与访客上传的文档走两套生命周期：
+
+| | 内置文档 | 临时文档 |
+|---|---|---|
+| 存放位置 | `backend/builtin_docs/`（**在镜像内**） | `backend/documents/`（走 `upload_data` 卷） |
+| 数据库标记 | `is_builtin = 1` | `is_builtin = 0` |
+| 能否删除 | 接口层拒绝，返回 `403` | 可删，或被 `/session/cleanup` 批量回收 |
+| 生命周期 | 容器重建后仍在，换服务器重新部署也一定在 | 关掉网页后再打开页面时被自动清空 |
+
+**为什么另放一个目录**：`upload_data` 卷在服务器首次部署时是空的，内置文档若放在
+`UPLOAD_DIR` 里，"开箱即有内容可问"就无从谈起；镜像内的文件不随卷清空而消失。
+
+**索引时机**：容器启动时由 `lifespan` 起一个**后台线程**处理，不阻塞启动 ——
+首次要解析 2 MB 的 PDF、切出上千个切片再全量写盘，同步做会让健康检查
+（`start-period 20s`）超时，容器会被判定不健康而反复重启。日志会打印：
+
+```
+[BUILTIN] 首次索引: VueJS官方文档.pdf
+[BUILTIN] 完成: VueJS官方文档.pdf，新增 xxx 个切片
+```
+
+**刷新页面**即可看到内容，服务本身不为它等待。索引幂等（靠内容哈希判断），容器重启不会重复切分。
+
+> 磁盘文件名刻意用纯英文（`vuejs-official-guide.pdf`）：容器 locale 未设置时 Python 的
+> 文件系统编码可能回退成 ASCII，中文文件名在 `os.listdir` / `open` 时会直接抛错，
+> 而这个错误只在 Linux 容器出现，本地 Windows 开发完全复现不了。
+> 界面上的显示名走 `main.py` 的 `BUILTIN_DISPLAY_NAMES` 映射，不受此限制。
 
 ---
 
@@ -323,10 +365,10 @@ Agent 按需自动调用：
 
 | 依赖 | 版本 | 大小 |
 |------|------|------|
-| vue | 3.5.42 | 594 KB |
+| vue | 3.5.42 | 580 KB |
 | marked | 12.0.2 | 35 KB |
 | dompurify | 3.4.15 | 29 KB |
-| @mdi/font | 7.4.47 | 347 KB CSS + 394 KB woff2 |
+| @mdi/font | 7.4.47 | 338 KB CSS + 394 KB woff2 |
 
 解决了两个问题：
 
@@ -346,5 +388,5 @@ MDI 字体只保留了 woff2 一种格式（原包含 eot/woff/ttf 共约 2.4 MB
 
 - [ ] 把关键词检索升级为 FAISS 向量检索（`faiss-cpu` 已在依赖里，尚未接入）
 - [ ] WebSocket 流式输出（当前是一次性返回完整回答）
-- [ ] 清理 `requirements.txt` 中未使用的依赖（`faiss-cpu`、`huggingface-hub`）
+- [ ] 清理 `requirements.txt` 中未使用的依赖（`faiss-cpu`、`huggingface-hub`、`langchain-openai`）
 - [ ] 索引增量更新，避免每次上传重建
