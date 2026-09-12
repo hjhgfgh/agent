@@ -2,7 +2,9 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- viewport-fit=cover 是下面 env(safe-area-inset-*) 能取到值的前提，
+         否则 iPhone 的刘海 / 底部横条区域一律返回 0 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>AI技术文档助手</title>
     <!-- 依赖已本地化到 vendor/，不再走 unpkg CDN。
          原因：访客的浏览器也要去访问 CDN，一旦被墙或超时，Vue 就加载不出来，
@@ -21,6 +23,11 @@
             box-sizing: border-box;
         }
 
+        html {
+            /* 防止 iOS 横竖屏切换时自作主张放大字号 */
+            -webkit-text-size-adjust: 100%;
+        }
+
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
             background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
@@ -30,7 +37,11 @@
 
         .app-container {
             display: flex;
+            /* 手机浏览器地址栏会伸缩，100vh 算的是「地址栏收起时」的高度，
+               会把底部输入框顶到屏幕外。dvh 跟随可见区域变化；
+               旧浏览器不识别 dvh，会自动退回上一行的 100vh。 */
             height: 100vh;
+            height: 100dvh;
         }
 
         /* 侧边栏 */
@@ -247,6 +258,8 @@
         .chat-messages {
             flex: 1;
             overflow-y: auto;
+            /* 滚到底部后继续下拉时，别触发浏览器的整页下拉刷新 */
+            overscroll-behavior: contain;
             padding: 30px;
         }
 
@@ -281,6 +294,11 @@
 
         .message-content {
             max-width: 70%;
+            /* min-width:0 不能省：flex 子项默认 min-width:auto，
+               不会缩得比内容更窄。少了这行，助手回复里的宽代码块/宽表格
+               会把气泡撑破视口（手机端尤其明显）。 */
+            min-width: 0;
+            overflow-wrap: break-word;
             padding: 12px 16px;
             border-radius: 12px;
             line-height: 1.6;
@@ -319,6 +337,7 @@
             padding: 12px;
             border-radius: 8px;
             overflow-x: auto;
+            max-width: 100%;
             margin: 10px 0;
         }
         .md-body pre code { background: none; padding: 0; }
@@ -329,6 +348,16 @@
             color: #bbb;
         }
         .md-body table { border-collapse: collapse; margin: 10px 0; }
+        /* 表格外面套一层横向滚动容器（由 renderMarkdown 注入）。
+           pre 早就写了 overflow-x:auto，表格却漏了 —— 5~6 列的表
+           在手机上会把气泡直接撑破。 */
+        .md-table-wrap {
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+            max-width: 100%;
+            margin: 10px 0;
+        }
+        .md-table-wrap table { margin: 0; }
         .md-body th, .md-body td {
             border: 1px solid rgba(255, 255, 255, 0.2);
             padding: 6px 10px;
@@ -621,13 +650,181 @@
             color: #ffc107;
             font-size: 12.5px;
         }
+
+        /* 抽屉相关元素默认隐藏，只在手机端启用（见下方媒体查询） */
+        .menu-btn { display: none; }
+        .sidebar-backdrop { display: none; }
+
+        /* ============================================================
+           移动端适配（屏幕宽 ≤768px）
+           ------------------------------------------------------------
+           桌面端是「侧边栏 280px + 聊天区」并排。手机 375px 宽时，
+           280px 的侧边栏吃掉 75%，聊天区只剩 95px —— 这就是「狭窄」的
+           根源，是数学上的必然，不是感觉问题。
+           手机端改「聊天区独占全宽 + 侧边栏变抽屉」，因为本应用的主行为
+           是提问，文档列表是偶尔用一次的次要动作。
+           ============================================================ */
+        @media (max-width: 768px) {
+            /* ---- 侧边栏 → 抽屉 ---- */
+            .sidebar {
+                position: fixed;
+                top: 0;
+                left: 0;
+                bottom: 0;
+                /* 不写死 280px：大屏手机竖屏也就 390~430px，
+                   用 vw 保证任何宽度下都留出边距，
+                   让用户能点到遮罩把抽屉关掉。 */
+                width: 84vw;
+                max-width: 320px;
+                z-index: 1500;
+                padding: 16px;
+                padding-left: calc(16px + env(safe-area-inset-left));
+                /* 必须给不透明背景：抽屉会盖在聊天区上，
+                   沿用原来的 rgba(255,255,255,0.05) 会透出下面的文字 */
+                background: linear-gradient(160deg, #1a1a2e 0%, #16213e 100%);
+                border-right: 1px solid rgba(0, 212, 255, 0.2);
+                transform: translateX(-100%);
+                /* visibility 一并过渡：收起后不再吃触摸事件，
+                   同时保留滑出动画（它是离散属性，会在动画末尾才切换） */
+                visibility: hidden;
+                transition: transform 0.28s ease, visibility 0.28s;
+            }
+
+            .sidebar.open {
+                transform: translateX(0);
+                visibility: visible;
+            }
+
+            .sidebar-backdrop {
+                display: block;
+                position: fixed;
+                /* 不用 inset:0 —— 它是 Chrome 87 / Safari 14.1 才支持的缩写，
+                   老一些的安卓 WebView（很多 App 的内置浏览器）不认，
+                   会导致遮罩宽高为 0：点不到，也就关不掉抽屉。
+                   这里按项目里 .gate-mask 的写法显式写四条边。 */
+                top: 0;
+                right: 0;
+                bottom: 0;
+                left: 0;
+                background: rgba(0, 0, 0, 0.55);
+                z-index: 1400;
+            }
+
+            .logo { font-size: 20px; margin-bottom: 16px; }
+
+            /* ---- 顶栏：给抽屉开关让位置 ---- */
+            .chat-header { padding: 12px 14px; gap: 10px; }
+            /* 撑开中间，把「新对话」顶到最右 */
+            .chat-title { flex: 1; font-size: 16px; }
+
+            .menu-btn {
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                /* 40px 已接近触摸目标下限，别再按视觉喜好改小 */
+                width: 40px;
+                height: 40px;
+                flex-shrink: 0;
+                border: none;
+                border-radius: 10px;
+                background: rgba(255, 255, 255, 0.08);
+                color: #00d4ff;
+                font-size: 20px;
+                cursor: pointer;
+            }
+
+            .new-chat-btn { padding: 8px 12px; font-size: 13px; }
+            .readonly-banner { padding: 8px 14px; font-size: 12px; }
+
+            /* ---- 消息区 ---- */
+            .chat-messages { padding: 14px; }
+            .message { gap: 8px; margin-bottom: 16px; }
+            .message-avatar { width: 32px; height: 32px; font-size: 17px; }
+            /* 桌面 70% 在手机上太窄；85% 能多放内容，
+               又保留头像一侧的视觉留白 */
+            .message-content { max-width: 85%; padding: 10px 13px; }
+
+            /* ---- 输入区 ---- */
+            .chat-input {
+                padding: 10px 12px;
+                /* 避开 iPhone 底部横条（依赖 head 里的 viewport-fit=cover） */
+                padding-bottom: calc(10px + env(safe-area-inset-bottom));
+            }
+            .input-container { gap: 8px; }
+            .send-btn { padding: 12px 16px; }
+
+            .empty-state { padding: 40px 16px; }
+            .empty-state i { font-size: 46px; }
+
+            /* ---- 口令遮罩：写死 340px 在 320px 宽的机器上会溢出 ---- */
+            .gate-card {
+                width: min(340px, calc(100vw - 32px));
+                padding: 26px 20px;
+            }
+
+            /* ---- 上传弹窗 ---- */
+            .upload-processing {
+                width: min(280px, calc(100vw - 40px));
+                padding: 24px 20px;
+            }
+            .progress-bar { width: 100%; }
+        }
+
+        /* ============================================================
+           触屏设备修正（按「指针类型」判断，与屏幕宽度无关）
+           ------------------------------------------------------------
+           这两处修的根因都是「有没有鼠标」，不是「屏幕多宽」，
+           所以不能塞进上面的 max-width 查询 —— 否则宽屏平板会漏掉，
+           而窄窗口的桌面浏览器反而被误伤。
+           ============================================================ */
+        @media (hover: none), (pointer: coarse) {
+            /* 用逗号（或）而不是 and：少数安卓/三星设备上
+               hover 与 pointer 的组合值不太规矩，用 and 会整套失效。
+               写成或，只要「不能悬停」或「主指针是手指」命中一个就生效；
+               而带触摸屏的笔记本主指针是精细的鼠标、hover 也为 hover，
+               不会命中，那边的悬停交互照旧。 */
+
+            /* iOS Safari 的规则：聚焦 font-size < 16px 的输入框时，
+               自动放大整个页面，且不会自动缩回。
+               这是「页面看起来被缩放/错位」最常见的根源。 */
+            .chat-textarea,
+            .gate-input {
+                font-size: 16px;
+            }
+
+            /* 触屏没有 hover，靠 :hover 才显示的删除按钮在手机上
+               永远显示不出来 —— 这是功能不可用，不只是不好看。 */
+            .doc-delete-btn {
+                opacity: 1;
+                /* 顺手把点击区域从 26px 放大到 32px */
+                width: 32px;
+                height: 32px;
+                font-size: 17px;
+            }
+
+            /* 去掉移动端点击时的那块灰色高亮 */
+            .upload-section,
+            .doc-item,
+            .doc-delete-btn,
+            .menu-btn,
+            .new-chat-btn,
+            .send-btn,
+            .gate-btn {
+                -webkit-tap-highlight-color: transparent;
+            }
+        }
     </style>
 </head>
 <body>
     <div id="app">
         <div class="app-container">
-            <!-- 侧边栏 -->
-            <div class="sidebar">
+            <!-- 抽屉遮罩：只在手机端显示（桌面端 CSS 隐藏），点它关闭抽屉 -->
+            <div v-if="sidebarOpen" class="sidebar-backdrop" @click="sidebarOpen = false"></div>
+
+            <!-- 侧边栏。手机端作为抽屉使用（见 CSS 的 max-width:768px 段）：
+                 :class 上的 open 在桌面端不会产生任何效果，
+                 因为相关样式全部写在媒体查询里，桌面端保持并排布局不变。 -->
+            <div class="sidebar" :class="{ open: sidebarOpen }">
                 <div class="logo">
                     <i class="mdi mdi-robot-happy"></i>
                     AI文档助手
@@ -701,6 +898,13 @@
                 </div>
 
                 <div class="chat-header">
+                    <!-- 抽屉开关：只在手机端显示（桌面端 CSS 设为 display:none，
+                         不参与 flex 布局，所以桌面端顶栏仍是原来的两项）。
+                         用 CSS 控制显隐而不是 JS 判断屏幕宽度，
+                         可以避免再引入一个 resize 监听。 -->
+                    <button class="menu-btn" title="知识库文档" @click="sidebarOpen = true">
+                        <i class="mdi mdi-menu"></i>
+                    </button>
                     <div class="chat-title">智能问答</div>
                     <button class="new-chat-btn" @click="newChat">
                         <i class="mdi mdi-plus"></i> 新对话
@@ -761,7 +965,7 @@
                             class="chat-textarea"
                             v-model="userInput"
                             @keydown.enter.ctrl="sendMessage"
-                            placeholder="输入你的问题，按 Ctrl+Enter 发送..."
+                            :placeholder="inputPlaceholder"
                             rows="1"
                             @input="autoResize"
                         ></textarea>
@@ -834,6 +1038,21 @@
                 const sessionId = ref('session_' + Date.now());
                 const clientId = ref('');       // 浏览器会话标识，用于区分"新打开"与"刷新"
                 const messagesContainer = ref(null);
+
+                // ===== 移动端状态 =====
+                // 手机端抽屉是否展开。桌面端这个值不会产生任何视觉效果，
+                // 因为抽屉样式全部写在 max-width:768px 的媒体查询里。
+                const sidebarOpen = ref(false);
+                // 触屏设备没有 Ctrl 键，提示语必须换掉，
+                // 否则用户会一直在软键盘上找一个不存在的按键。
+                // 这个媒体查询必须和 CSS 里那段触屏修正保持一致，
+                // 否则会出现「提示语按手机渲染、字号却按桌面渲染」的错配。
+                // matchMedia 支持逗号分隔的查询列表，命中任意一条即为 true。
+                const isTouchDevice = !!(window.matchMedia
+                    && window.matchMedia('(hover: none), (pointer: coarse)').matches);
+                const inputPlaceholder = isTouchDevice
+                    ? '输入你的问题...'
+                    : '输入你的问题，按 Ctrl+Enter 发送...';
 
                 // ===== 访问口令 / 只读模式状态 =====
                 const ACCESS_CODE_KEY = 'doc_assistant_access_code';
@@ -1114,6 +1333,9 @@
                         } else {
                             alert(`文档上传成功！\n切片数量: ${data.chunks}\n耗时: ${cost}s`);
                         }
+                        // 手机上收起抽屉，让用户直接回到问答区
+                        // （桌面端本来就没有抽屉，这行等价于无操作）
+                        sidebarOpen.value = false;
                         await loadDocuments();
                     } catch (err) {
                         if (err.name === 'AbortError') {
@@ -1207,9 +1429,17 @@
                     try {
                         marked.setOptions({ breaks: true, gfm: true });
                         const html = marked.parse(raw);
-                        return typeof DOMPurify !== 'undefined'
+                        const safe = typeof DOMPurify !== 'undefined'
                             ? DOMPurify.sanitize(html)
                             : html;
+                        // 给表格套一层横向滚动容器，否则手机上宽表格会撑破气泡。
+                        // 放在 DOMPurify 之后做，避免注入的 class 被净化器改写；
+                        // 这里只做字符串替换、不解析 HTML，风险可控。
+                        // 万一 marked 将来输出带属性的 <table>，匹配不到也只是
+                        // 退回原样渲染，不会出错。
+                        return safe
+                            .replace(/<table>/g, '<div class="md-table-wrap"><table>')
+                            .replace(/<\/table>/g, '</table></div>');
                     } catch (e) {
                         return raw
                             .replace(/&/g, '&amp;')
@@ -1258,7 +1488,10 @@
                     gateError,
                     gateChecking,
                     readOnly,
-                    submitGate
+                    submitGate,
+                    // 移动端
+                    sidebarOpen,
+                    inputPlaceholder
                 };
             }
         }).mount('#app');
