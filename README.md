@@ -216,8 +216,7 @@ ai-tech-doc-assistant/
 ├── frontend/
 │   ├── index.html              # Vue 3 单页应用
 │   └── vendor/                 # 前端依赖本地化
-├── database/init.sql           # 建表脚本（首次启动自动执行）
-└── _verify_frontend.js         # 前端静态校验脚本（开发工具）
+└── database/init.sql           # 建表脚本（首次启动自动执行）
 ```
 
 ---
