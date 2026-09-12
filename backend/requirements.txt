@@ -1,0 +1,32 @@
+# Core Dependencies
+fastapi==0.115.14
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.6
+
+# LangChain Ecosystem
+langchain==1.4.0
+langchain-community
+langchain-openai
+langchain-text-splitters
+
+# Embeddings & Vector Store
+faiss-cpu==1.10.0
+huggingface-hub==0.28.1
+
+# Database
+sqlalchemy==2.0.37
+pymysql==1.1.1
+
+# Redis
+redis==5.2.1
+
+# PDF Processing
+pdfplumber==0.11.5
+pymupdf>=1.24.0        # 快速PDF文本提取（比PyPDFLoader快约80倍）
+
+# LLM (通义千问 / DashScope OpenAI 兼容接口)
+openai>=1.40.0
+
+# Environment
+python-dotenv==1.0.1

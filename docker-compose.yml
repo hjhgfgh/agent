@@ -1,0 +1,117 @@
+# ============================================================
+# AI技术文档助手 - 一键启动（后端 + MySQL + Redis）
+#
+#   docker compose up -d --build     启动全部
+#   docker compose logs -f backend   看后端日志
+#   docker compose down              停止（数据保留）
+#   docker compose down -v           停止并删除数据（慎用）
+#
+# 配置分两处，各司其职：
+#   backend/.env  应用配置 —— LLM 密钥、ACCESS_CODE、READ_ONLY（本地开发共用同一份）
+#   .env（根目录） 编排配置 —— MySQL 密码、对外端口（可选，不建就用下面的默认值）
+#
+# ⚠️ 两个 .env 都已被 .gitignore 忽略，不会进仓库、也不会进镜像。
+# ============================================================
+
+services:
+  # ---------- MySQL ----------
+  mysql:
+    image: mysql:8.0
+    container_name: doc-assistant-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: tech_doc_assistant
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      # 建表脚本仅在该卷为空（首次启动）时执行一次，之后不会再跑，
+      # 所以脚本里的 DROP TABLE 不会误删已有数据。
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    # ⚠️ 刻意不做端口映射：MySQL 只在 Docker 内部网络可见。
+    # 映射到公网等于把 3306 暴露给全世界扫描，这是最常见的被入侵入口。
+    networks:
+      - app-net
+
+  # ---------- Redis ----------
+  redis:
+    image: redis:7-alpine
+    container_name: doc-assistant-redis
+    restart: unless-stopped
+    # 开启 AOF 持久化：默认只存内存，容器重启后多轮对话上下文会全部丢失
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    # 同样不映射到公网：Redis 无密码，暴露即等于任人读写
+    networks:
+      - app-net
+
+  # ---------- 后端（含前端静态页面，同源托管）----------
+  backend:
+    build:
+      context: .            # 必须是根目录，理由见 Dockerfile 顶部注释
+      dockerfile: Dockerfile
+    container_name: doc-assistant-backend
+    restart: unless-stopped
+    depends_on:
+      # 等健康检查通过再启动，避免 MySQL 还在初始化时后端就连过去报错
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # 复用本地开发的那份 .env（LLM 密钥 / 口令 / 只读开关）
+    env_file:
+      - ./backend/.env
+    environment:
+      # ⚠️ 必须覆盖成服务名，这两行是整个 Docker 改造的关键。
+      # 容器里的 localhost 指容器自己，而 MySQL/Redis 在另外的容器里，
+      # 沿用 .env 里的 localhost 会 100% 连不上。
+      # 注：environment 优先级高于 env_file，所以这里能覆盖 .env 的同名值。
+      DATABASE_URL: mysql+pymysql://root:${MYSQL_ROOT_PASSWORD:-123456}@mysql:3306/tech_doc_assistant
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      # ⚠️ 这里刻意【不】声明 ACCESS_CODE / READ_ONLY，它们只从
+      #    backend/.env（上面的 env_file）读取。
+      #
+      # 曾经写成 ACCESS_CODE: ${ACCESS_CODE:-}，是个隐藏很深的坑：
+      # 该写法由 compose 从「根目录 .env 或 shell 环境变量」取值，取不到就是空串；
+      # 而 environment 的优先级高于 env_file，于是它会把 backend/.env 里
+      # 已经设置好的 ACCESS_CODE 覆盖成空 —— 口令静默失效。
+      # 后果：你以为开了口令保护，实际公网任何人都能直接调 /chat 烧你的额度。
+      # 现在单一来源，不会再互相覆盖。
+      TZ: Asia/Shanghai
+    ports:
+      # 只暴露这一个端口。服务器上用 80 时把 BACKEND_PORT 改成 80 即可。
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      # 索引与上传的 PDF 放在卷里：容器重建后知识库还在，
+      # 否则每次 docker compose up --build 都要重新上传文档。
+      - faiss_data:/app/backend/faiss_index
+      - upload_data:/app/backend/documents
+    networks:
+      - app-net
+
+volumes:
+  mysql_data:
+  redis_data:
+  faiss_data:
+  upload_data:
+
+networks:
+  app-net:
+    driver: bridge

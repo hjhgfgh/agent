@@ -1,0 +1,1147 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI技术文档助手</title>
+    <!-- 依赖已本地化到 vendor/，不再走 unpkg CDN。
+         原因：访客的浏览器也要去访问 CDN，一旦被墙或超时，Vue 就加载不出来，
+         整个页面白屏 —— 而这个错误发生在访客浏览器里，你在服务器日志上
+         完全看不到，排查起来极其痛苦。
+         顺带把浮动版本号锁死了：vue 3.5.42 / marked 12.0.2 /
+         dompurify 3.4.15 / @mdi/font 7.4.47（升级时替换 vendor/ 下文件即可）。 -->
+    <script src="vendor/vue.global.js"></script>
+    <script src="vendor/marked.min.js"></script>
+    <script src="vendor/purify.min.js"></script>
+    <link rel="stylesheet" href="vendor/mdi/css/materialdesignicons.min.css">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #eee;
+        }
+
+        .app-container {
+            display: flex;
+            height: 100vh;
+        }
+
+        /* 侧边栏 */
+        .sidebar {
+            width: 280px;
+            background: rgba(255, 255, 255, 0.05);
+            border-right: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .logo {
+            font-size: 24px;
+            font-weight: bold;
+            margin-bottom: 30px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #00d4ff;
+        }
+
+        .upload-section {
+            margin-top: 20px;
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 12px;
+            border: 2px dashed rgba(255, 255, 255, 0.2);
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .upload-section:hover {
+            border-color: #00d4ff;
+            background: rgba(0, 212, 255, 0.1);
+        }
+
+        .upload-section i {
+            font-size: 40px;
+            color: #00d4ff;
+            margin-bottom: 10px;
+        }
+
+        .doc-list {
+            margin-top: 20px;
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .doc-item {
+            padding: 12px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .doc-item:hover {
+            background: rgba(0, 212, 255, 0.2);
+        }
+
+        .doc-item.active {
+            background: rgba(0, 212, 255, 0.3);
+            border-left: 3px solid #00d4ff;
+        }
+
+        .doc-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .doc-name {
+            font-size: 14px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .doc-chunks {
+            font-size: 12px;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        /* 删除按钮：默认隐藏，悬停文档时出现，避免列表视觉噪音 */
+        .doc-delete-btn {
+            width: 26px;
+            height: 26px;
+            flex-shrink: 0;
+            border: none;
+            border-radius: 6px;
+            background: rgba(255, 82, 82, 0.15);
+            color: #ff5252;
+            font-size: 15px;
+            line-height: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            opacity: 0;
+            transition: all 0.2s;
+        }
+
+        .doc-item:hover .doc-delete-btn {
+            opacity: 1;
+        }
+
+        .doc-delete-btn:hover:not(:disabled) {
+            background: #ff5252;
+            color: #fff;
+        }
+
+        .doc-delete-btn:disabled {
+            opacity: 1;
+            cursor: not-allowed;
+        }
+
+        .doc-notice {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 12px;
+            color: #00d4ff;
+            background: rgba(0, 212, 255, 0.12);
+            border-radius: 6px;
+            padding: 7px 9px;
+            margin-bottom: 8px;
+        }
+
+        /* 主聊天区域 */
+        .main-chat {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chat-header {
+            padding: 20px 30px;
+            background: rgba(255, 255, 255, 0.05);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .chat-title {
+            font-size: 18px;
+            font-weight: 500;
+        }
+
+        .new-chat-btn {
+            padding: 8px 16px;
+            background: rgba(0, 212, 255, 0.2);
+            border: 1px solid #00d4ff;
+            border-radius: 8px;
+            color: #00d4ff;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .new-chat-btn:hover {
+            background: #00d4ff;
+            color: #1a1a2e;
+        }
+
+        .chat-messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 30px;
+        }
+
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 12px;
+        }
+
+        .message.user {
+            flex-direction: row-reverse;
+        }
+
+        .message-avatar {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+        }
+
+        .message-content {
+            max-width: 70%;
+            padding: 12px 16px;
+            border-radius: 12px;
+            line-height: 1.6;
+        }
+
+        .message.user .message-content {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            border-top-right-radius: 4px;
+        }
+
+        .message.assistant .message-content {
+            background: rgba(255, 255, 255, 0.1);
+            border-top-left-radius: 4px;
+        }
+
+        /* Markdown 渲染样式 */
+        .md-body > *:first-child { margin-top: 0; }
+        .md-body > *:last-child { margin-bottom: 0; }
+        .md-body h1, .md-body h2, .md-body h3, .md-body h4 {
+            margin: 14px 0 8px;
+            font-size: 15px;
+            font-weight: 600;
+        }
+        .md-body p { margin: 8px 0; }
+        .md-body ul, .md-body ol { margin: 8px 0 8px 20px; }
+        .md-body li { margin: 4px 0; }
+        .md-body code {
+            background: rgba(0, 0, 0, 0.35);
+            padding: 2px 5px;
+            border-radius: 4px;
+            font-family: Consolas, Monaco, 'Courier New', monospace;
+            font-size: 12.5px;
+        }
+        .md-body pre {
+            background: rgba(0, 0, 0, 0.45);
+            padding: 12px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 10px 0;
+        }
+        .md-body pre code { background: none; padding: 0; }
+        .md-body blockquote {
+            border-left: 3px solid #667eea;
+            padding-left: 10px;
+            margin: 8px 0;
+            color: #bbb;
+        }
+        .md-body table { border-collapse: collapse; margin: 10px 0; }
+        .md-body th, .md-body td {
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            padding: 6px 10px;
+            font-size: 13px;
+        }
+        .md-body a { color: #8ab4ff; }
+
+        .message-sources {
+            margin-top: 8px;
+            font-size: 12px;
+            color: #888;
+        }
+
+        .tool-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            background: rgba(255, 193, 7, 0.2);
+            border: 1px solid #ffc107;
+            border-radius: 4px;
+            font-size: 11px;
+            color: #ffc107;
+            margin-top: 8px;
+            margin-right: 4px;
+        }
+
+        /* 输入区域 */
+        .chat-input {
+            padding: 20px 30px;
+            background: rgba(255, 255, 255, 0.05);
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .input-container {
+            display: flex;
+            gap: 12px;
+        }
+
+        .chat-textarea {
+            flex: 1;
+            padding: 12px 16px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 12px;
+            color: #eee;
+            font-size: 14px;
+            resize: none;
+            min-height: 50px;
+            max-height: 150px;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        .chat-textarea:focus {
+            border-color: #00d4ff;
+        }
+
+        .chat-textarea::placeholder {
+            color: #666;
+        }
+
+        .send-btn {
+            padding: 12px 24px;
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            border: none;
+            border-radius: 12px;
+            color: #fff;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .send-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 212, 255, 0.4);
+        }
+
+        .send-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* 加载动画 */
+        .typing-indicator {
+            display: flex;
+            gap: 4px;
+            padding: 12px 16px;
+        }
+
+        .typing-dot {
+            width: 8px;
+            height: 8px;
+            background: #00d4ff;
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+
+        .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+        .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+        @keyframes typing {
+            0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+            30% { transform: translateY(-10px); opacity: 1; }
+        }
+
+        /* 文件上传处理 */
+        .upload-processing {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(0, 0, 0, 0.9);
+            padding: 30px 50px;
+            border-radius: 16px;
+            z-index: 1000;
+            text-align: center;
+        }
+
+        .progress-bar {
+            width: 200px;
+            height: 4px;
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 2px;
+            margin-top: 15px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d4ff, #0099cc);
+            animation: progress 2s ease-in-out infinite;
+        }
+
+        @keyframes progress {
+            0% { width: 0%; margin-left: 0; }
+            50% { width: 70%; margin-left: 15%; }
+            100% { width: 0%; margin-left: 100%; }
+        }
+
+        /* 滚动条样式 */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(0, 212, 255, 0.3);
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(0, 212, 255, 0.5);
+        }
+
+        /* 空状态提示 */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #666;
+        }
+
+        .empty-state i {
+            font-size: 60px;
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .welcome-text {
+            font-size: 16px;
+            margin-bottom: 10px;
+        }
+
+        .hint-text {
+            font-size: 13px;
+            color: #555;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        /* ===== 访问口令遮罩 ===== */
+        .gate-mask {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(10, 10, 22, 0.9);
+            z-index: 2000;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .gate-card {
+            width: 340px;
+            padding: 32px 28px;
+            background: #1a1a2e;
+            border: 1px solid rgba(0, 212, 255, 0.25);
+            border-radius: 16px;
+            text-align: center;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+        }
+
+        .gate-icon {
+            font-size: 42px;
+            color: #00d4ff;
+        }
+
+        .gate-title {
+            font-size: 17px;
+            margin: 12px 0 6px;
+        }
+
+        .gate-desc {
+            font-size: 12.5px;
+            color: #888;
+            margin-bottom: 18px;
+            line-height: 1.7;
+        }
+
+        .gate-input {
+            width: 100%;
+            padding: 11px 14px;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            color: #eee;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.25s;
+        }
+
+        .gate-input:focus {
+            border-color: #00d4ff;
+        }
+
+        .gate-input:disabled {
+            opacity: 0.6;
+        }
+
+        .gate-btn {
+            width: 100%;
+            margin-top: 14px;
+            padding: 11px;
+            background: linear-gradient(135deg, #00d4ff 0%, #0099cc 100%);
+            border: none;
+            border-radius: 10px;
+            color: #fff;
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .gate-btn:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 15px rgba(0, 212, 255, 0.4);
+        }
+
+        .gate-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .gate-error {
+            margin-top: 12px;
+            min-height: 16px;
+            font-size: 12.5px;
+            color: #ff5252;
+        }
+
+        /* ===== 只读模式提示条 ===== */
+        .readonly-banner {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 30px;
+            background: rgba(255, 193, 7, 0.12);
+            border-bottom: 1px solid rgba(255, 193, 7, 0.3);
+            color: #ffc107;
+            font-size: 12.5px;
+        }
+    </style>
+</head>
+<body>
+    <div id="app">
+        <div class="app-container">
+            <!-- 侧边栏 -->
+            <div class="sidebar">
+                <div class="logo">
+                    <i class="mdi mdi-robot-happy"></i>
+                    AI文档助手
+                </div>
+
+                <!-- 上传区域：只读模式整体隐藏。
+                     只靠后端 403 拦截是不够的 —— 访客点了没反应会以为系统坏了，
+                     直接不渲染入口，配上方的只读提示条才讲得清楚。 -->
+                <template v-if="!readOnly">
+                    <div class="upload-section" @click="$refs.fileInput.click()">
+                        <i class="mdi mdi-cloud-upload"></i>
+                        <div>上传技术文档PDF</div>
+                        <div style="font-size: 12px; color: #666; margin-top: 5px;">点击或拖拽文件</div>
+                    </div>
+                    <input type="file" ref="fileInput" accept=".pdf" @change="handleFileUpload">
+                </template>
+
+                <!-- 文档列表 -->
+                <div class="doc-list">
+                    <div style="font-size: 12px; color: #666; margin-bottom: 10px;">已上传文档</div>
+                    <div v-if="notice" class="doc-notice">
+                        <i class="mdi mdi-check-circle-outline"></i> {{ notice }}
+                    </div>
+                    <div 
+                        v-for="doc in documents" 
+                        :key="doc.id"
+                        class="doc-item"
+                        :class="{ active: doc.id === activeDocId }"
+                    >
+                        <div class="doc-info">
+                            <div class="doc-name" :title="doc.original_name || doc.filename">
+                                {{ doc.original_name || doc.filename }}
+                            </div>
+                            <div class="doc-chunks">{{ doc.chunk_count }} 个切片</div>
+                        </div>
+                        <button
+                            v-if="!readOnly"
+                            class="doc-delete-btn"
+                            title="删除该文档"
+                            :disabled="deletingId === doc.id"
+                            @click.stop="deleteDocument(doc)"
+                        >
+                            <i :class="deletingId === doc.id ? 'mdi mdi-loading mdi-spin' : 'mdi mdi-trash-can-outline'"></i>
+                        </button>
+                    </div>
+                    <div v-if="documents.length === 0" style="color: #555; font-size: 13px; text-align: center; padding: 20px;">
+                        暂无文档
+                    </div>
+                </div>
+            </div>
+
+            <!-- 主聊天区域 -->
+            <div class="main-chat">
+                <!-- 只读模式提示：让访客明白为什么没有上传入口，
+                     而不是以为页面坏了 -->
+                <div v-if="readOnly" class="readonly-banner">
+                    <i class="mdi mdi-eye-outline"></i>
+                    <span>当前为只读演示模式：可以提问，不能上传或删除文档</span>
+                </div>
+
+                <div class="chat-header">
+                    <div class="chat-title">智能问答</div>
+                    <button class="new-chat-btn" @click="newChat">
+                        <i class="mdi mdi-plus"></i> 新对话
+                    </button>
+                </div>
+
+                <div class="chat-messages" ref="messagesContainer">
+                    <!-- 欢迎状态 -->
+                    <div v-if="messages.length === 0" class="empty-state">
+                        <i class="mdi mdi-comment-text-outline"></i>
+                        <div class="welcome-text">上传技术文档后，开始提问吧！</div>
+                        <div class="hint-text">支持 Vue、React、FastAPI 等技术文档的问答</div>
+                    </div>
+
+                    <!-- 消息列表 -->
+                    <template v-for="(msg, index) in messages" :key="index">
+                        <div class="message" :class="msg.role">
+                            <div class="message-avatar">
+                                <i :class="msg.role === 'user' ? 'mdi mdi-account' : 'mdi mdi-robot'"></i>
+                            </div>
+                            <div class="message-content">
+                                <div class="md-body" v-html="renderMarkdown(msg.content)"></div>
+                                <div v-if="msg.sources && msg.sources.length" class="message-sources">
+                                    <i class="mdi mdi-book-open-variant"></i> {{ msg.sources.join('、') }}
+                                </div>
+                                <template v-if="msg.tools_used && msg.tools_used.length">
+                                    <div class="tool-badge" v-for="tool in msg.tools_used" :key="tool">
+                                        <i class="mdi mdi-cog"></i> {{ tool }}
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+
+                    <!-- 加载中状态 -->
+                    <div v-if="isThinking" class="message assistant">
+                        <div class="message-avatar">
+                            <i class="mdi mdi-robot"></i>
+                        </div>
+                        <div class="message-content">
+                            <div class="typing-indicator">
+                                <div class="typing-dot"></div>
+                                <div class="typing-dot"></div>
+                                <div class="typing-dot"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 输入区域 -->
+                <div class="chat-input">
+                    <div class="input-container">
+                        <textarea
+                            class="chat-textarea"
+                            v-model="userInput"
+                            @keydown.enter.ctrl="sendMessage"
+                            placeholder="输入你的问题，按 Ctrl+Enter 发送..."
+                            rows="1"
+                            @input="autoResize"
+                        ></textarea>
+                        <button 
+                            class="send-btn" 
+                            @click="sendMessage"
+                            :disabled="isThinking || !userInput.trim()"
+                        >
+                            <i class="mdi mdi-send"></i>
+                            发送
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 访问口令遮罩：后端设了 ACCESS_CODE 且尚未通过校验时显示。
+             后端没设口令时 /auth/verify 直接返回 200，这层根本不会出现，
+             本地开发的体验完全不受影响。 -->
+        <div v-if="gateVisible" class="gate-mask">
+            <div class="gate-card">
+                <i class="mdi mdi-lock-outline gate-icon"></i>
+                <div class="gate-title">需要访问口令</div>
+                <div class="gate-desc">
+                    这是演示环境，请向系统管理员索取<br>访问口令后进入
+                </div>
+                <input
+                    class="gate-input"
+                    type="password"
+                    v-model="gateInput"
+                    placeholder="请输入访问口令"
+                    :disabled="gateChecking"
+                    @keyup.enter="submitGate"
+                >
+                <button
+                    class="gate-btn"
+                    @click="submitGate"
+                    :disabled="gateChecking || !gateInput.trim()"
+                >
+                    {{ gateChecking ? '校验中...' : '进入系统' }}
+                </button>
+                <div class="gate-error">{{ gateError }}</div>
+            </div>
+        </div>
+
+        <!-- 上传处理弹窗 -->
+        <div v-if="uploading" class="upload-processing">
+            <i class="mdi mdi-cloud-upload" style="font-size: 40px; color: #00d4ff;"></i>
+            <div style="margin-top: 15px;">正在处理文档...</div>
+            <div class="progress-bar">
+                <div class="progress-fill"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const { createApp, ref, onMounted, nextTick } = Vue;
+
+        createApp({
+            setup() {
+                // 状态
+                const documents = ref([]);
+                const messages = ref([]);
+                const userInput = ref('');
+                const isThinking = ref(false);
+                const uploading = ref(false);
+                const activeDocId = ref(null);
+                const deletingId = ref(null);   // 正在删除的文档 id，用于禁用按钮、防重复提交
+                const notice = ref('');         // 文档列表上方的轻提示
+                const sessionId = ref('session_' + Date.now());
+                const messagesContainer = ref(null);
+
+                // ===== 访问口令 / 只读模式状态 =====
+                const ACCESS_CODE_KEY = 'doc_assistant_access_code';
+                const accessCode = ref(localStorage.getItem(ACCESS_CODE_KEY) || '');
+                const gateVisible = ref(false);   // 是否显示口令遮罩
+                const gateInput = ref('');
+                const gateError = ref('');
+                const gateChecking = ref(false);
+                const readOnly = ref(false);      // 由后端 /auth/verify 告知
+                const ready = ref(false);         // 口令通过后才允许加载数据
+
+                // API基础地址
+                // 线上由后端同源托管本页面，用相对地址即可，切勿写死 localhost
+                // （写死会让访客的浏览器去访问访客自己的电脑，页面永远"连不上后端"）
+                // 本地用 file:// 双击打开时没有 host，回退到本地后端，方便开发
+                const API_BASE = ['http:', 'https:'].includes(window.location.protocol)
+                    ? window.location.origin
+                    : 'http://localhost:8000';
+                const UPLOAD_TIMEOUT = 180000; // 上传最长等待 180s
+                const CHAT_TIMEOUT = 60000;     // 问答最长等待 60s
+
+                // ===== 访问口令 =====
+
+                // 口令存 localStorage：刷新页面不用重输。
+                // 它不是账号密码，只是挡陌生访客的演示门槛 ——
+                // 真正的拦截在后端中间件里，前端这层只负责体验。
+                const authHeaders = () => (
+                    accessCode.value ? { 'X-Access-Code': accessCode.value } : {}
+                );
+
+                // message 为空时保留已有错误文案：
+                // onMounted 里是「先拿到错误、再决定弹框」，
+                // 若这里无条件清空，提示会被吃掉，用户看到的是一片空白。
+                const openGate = (message) => {
+                    if (message) gateError.value = message;
+                    gateVisible.value = true;
+                };
+
+                // 校验口令。后端 /auth/verify 本身也受守卫保护：
+                // 拿到 200 说明口令正确；401 表示没带或不对。
+                const checkAccess = async (silent = false) => {
+                    try {
+                        const res = await fetchWithTimeout(`${API_BASE}/auth/verify`, {}, 15000);
+                        if (res.ok) {
+                            const data = await res.json();
+                            readOnly.value = !!data.read_only;
+                            gateVisible.value = false;
+                            gateError.value = '';
+                            return true;
+                        }
+                        if (!silent) gateError.value = await parseError(res);
+                        return false;
+                    } catch (err) {
+                        if (!silent) gateError.value = '无法连接后端，请确认服务已启动';
+                        return false;
+                    }
+                };
+
+                const submitGate = async () => {
+                    const code = gateInput.value.trim();
+                    if (!code || gateChecking.value) return;
+
+                    gateChecking.value = true;
+                    gateError.value = '';
+                    accessCode.value = code;   // 先装上，后续请求才带得出去
+
+                    const ok = await checkAccess(false);
+                    if (ok) {
+                        localStorage.setItem(ACCESS_CODE_KEY, code);
+                        ready.value = true;
+                        await loadDocuments();
+                    } else {
+                        // 口令错了就清掉本地缓存，避免带着错口令继续请求
+                        localStorage.removeItem(ACCESS_CODE_KEY);
+                    }
+                    gateChecking.value = false;
+                };
+
+                // 带超时的请求封装
+                const fetchWithTimeout = async (url, options = {}, timeout = CHAT_TIMEOUT) => {
+                    const controller = new AbortController();
+                    const timer = setTimeout(() => controller.abort(), timeout);
+                    try {
+                        const res = await fetch(url, {
+                            ...options,
+                            headers: { ...authHeaders(), ...(options.headers || {}) },
+                            signal: controller.signal
+                        });
+                        // 口令失效立刻弹回遮罩。否则用户会对着一个永远失败的
+                        // 界面反复点"发送"，完全不知道是口令过期了。
+                        if (res.status === 401) openGate('访问口令已失效，请重新输入');
+                        return res;
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                };
+
+                // 解析后端错误信息
+                const parseError = async (res) => {
+                    try {
+                        const data = await res.json();
+                        if (data && data.detail) return data.detail;
+                    } catch (e) { /* ignore */ }
+                    return `HTTP ${res.status}`;
+                };
+
+                // 自动调整textarea高度
+                const autoResize = (e) => {
+                    e.target.style.height = 'auto';
+                    e.target.style.height = Math.min(e.target.scrollHeight, 150) + 'px';
+                };
+
+                // 滚动到底部
+                const scrollToBottom = () => {
+                    nextTick(() => {
+                        if (messagesContainer.value) {
+                            messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+                        }
+                    });
+                };
+
+                // 获取文档列表
+                // 两个要点：
+                //   1. 必须走 fetchWithTimeout（它会注入 X-Access-Code）。
+                //      之前这里是裸 fetch，设了口令之后会被后端拦成 401，
+                //      表现为"文档列表永远是空的"。
+                //   2. ready 之前不请求：没通过口令就拉列表，
+                //      等于绕过遮罩把文档名泄露出去。
+                const loadDocuments = async () => {
+                    if (!ready.value) return;
+                    try {
+                        const res = await fetchWithTimeout(`${API_BASE}/documents`, {}, 15000);
+                        if (!res.ok) {
+                            console.error('获取文档列表失败: HTTP', res.status);
+                            return;
+                        }
+                        const data = await res.json();
+                        documents.value = Array.isArray(data) ? data : [];
+                    } catch (err) {
+                        console.error('获取文档列表失败:', err);
+                    }
+                };
+
+                // 轻提示（自动消失）
+                let noticeTimer = null;
+                const showNotice = (text) => {
+                    notice.value = text;
+                    clearTimeout(noticeTimer);
+                    noticeTimer = setTimeout(() => { notice.value = ''; }, 3500);
+                };
+
+                // 删除已上传文档：二次确认 → 调接口 → 刷新列表
+                const deleteDocument = async (doc) => {
+                    if (deletingId.value) return;   // 已有删除任务在进行中
+
+                    const name = doc.original_name || doc.filename;
+                    const ok = confirm(
+                        `确定删除文档《${name}》吗？\n\n` +
+                        `该文档的 ${doc.chunk_count} 个切片和原始 PDF 都会被移除，且无法恢复。`
+                    );
+                    if (!ok) return;
+
+                    deletingId.value = doc.id;
+                    try {
+                        const res = await fetchWithTimeout(
+                            `${API_BASE}/documents/${doc.id}`,
+                            { method: 'DELETE' },
+                            CHAT_TIMEOUT
+                        );
+                        if (!res.ok) {
+                            throw new Error(await parseError(res));
+                        }
+                        const data = await res.json();
+
+                        if (activeDocId.value === doc.id) activeDocId.value = null;
+                        await loadDocuments();
+                        showNotice(`已删除《${name}》，清理 ${data.removed_chunks} 个切片`);
+                    } catch (err) {
+                        const msg = err.name === 'AbortError'
+                            ? '请求超时，请稍后重试。'
+                            : err.message;
+                        alert(`删除失败：${msg}`);
+                    } finally {
+                        deletingId.value = null;
+                    }
+                };
+
+                // 处理文件上传
+                const handleFileUpload = async (event) => {
+                    const file = event.target.files[0];
+                    if (!file) return;
+
+                    if (!file.name.toLowerCase().endsWith('.pdf')) {
+                        alert('只支持PDF格式的文件');
+                        event.target.value = '';
+                        return;
+                    }
+
+                    uploading.value = true;
+                    const startedAt = Date.now();
+                    const formData = new FormData();
+                    formData.append('file', file);
+
+                    try {
+                        const res = await fetchWithTimeout(`${API_BASE}/upload`, {
+                            method: 'POST',
+                            body: formData
+                        }, UPLOAD_TIMEOUT);
+
+                        // 检查 HTTP 状态，避免后端 500 时静默失败
+                        if (!res.ok) {
+                            const detail = await parseError(res);
+                            alert(`上传失败：${detail}`);
+                            return;
+                        }
+
+                        const data = await res.json();
+                        const cost = ((Date.now() - startedAt) / 1000).toFixed(1);
+
+                        if (data.duplicated) {
+                            alert(`该文档已存在，已跳过重复处理。\n耗时: ${cost}s`);
+                        } else {
+                            alert(`文档上传成功！\n切片数量: ${data.chunks}\n耗时: ${cost}s`);
+                        }
+                        await loadDocuments();
+                    } catch (err) {
+                        if (err.name === 'AbortError') {
+                            alert('上传超时，请检查文档大小或稍后重试。');
+                        } else {
+                            alert('上传失败: ' + err.message);
+                        }
+                    } finally {
+                        uploading.value = false;
+                        event.target.value = '';
+                    }
+                };
+
+                // 发送消息
+                const sendMessage = async () => {
+                    if (!userInput.value.trim() || isThinking.value) return;
+
+                    const question = userInput.value.trim();
+                    userInput.value = '';
+                    isThinking.value = true;
+                    scrollToBottom();
+
+                    // 添加用户消息
+                    messages.value.push({
+                        role: 'user',
+                        content: question,
+                        sources: []
+                    });
+
+                    try {
+                        const res = await fetchWithTimeout(`${API_BASE}/chat`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                session_id: sessionId.value,
+                                question: question
+                            })
+                        }, CHAT_TIMEOUT);
+
+                        if (!res.ok) {
+                            const detail = await parseError(res);
+                            throw new Error(detail);
+                        }
+
+                        const data = await res.json();
+
+                        // 添加助手回复
+                        messages.value.push({
+                            role: 'assistant',
+                            content: data.answer,
+                            sources: data.sources || [],
+                            tools_used: data.tools_used || []
+                        });
+                    } catch (err) {
+                        const msg = err.name === 'AbortError'
+                            ? '请求超时，请稍后重试。'
+                            : `抱歉，请求失败：${err.message}`;
+                        messages.value.push({
+                            role: 'assistant',
+                            content: msg,
+                            sources: [],
+                            tools_used: []
+                        });
+                    } finally {
+                        isThinking.value = false;
+                        scrollToBottom();
+                    }
+                };
+
+                // 新建对话
+                const newChat = () => {
+                    messages.value = [];
+                    sessionId.value = 'session_' + Date.now();
+                };
+
+                // Markdown 渲染（大模型返回的是 Markdown，需转成 HTML 展示）
+                const renderMarkdown = (text) => {
+                    const raw = String(text || '');
+
+                    // 纯文本（如本地报错提示、降级说明）直接转义换行即可
+                    if (typeof marked === 'undefined') {
+                        return raw
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\n/g, '<br>');
+                    }
+
+                    try {
+                        marked.setOptions({ breaks: true, gfm: true });
+                        const html = marked.parse(raw);
+                        return typeof DOMPurify !== 'undefined'
+                            ? DOMPurify.sanitize(html)
+                            : html;
+                    } catch (e) {
+                        return raw
+                            .replace(/&/g, '&amp;')
+                            .replace(/</g, '&lt;')
+                            .replace(/>/g, '&gt;')
+                            .replace(/\n/g, '<br>');
+                    }
+                };
+
+                // 初始化：先确认访问权限，通过了再加载数据。
+                // 后端没设 ACCESS_CODE 时 /auth/verify 直接返回 200，
+                // 不会弹口令框，本地开发体验和以前完全一致。
+                onMounted(async () => {
+                    const ok = await checkAccess(false);
+                    if (ok) {
+                        ready.value = true;
+                        await loadDocuments();
+                    } else {
+                        openGate('');
+                    }
+                });
+
+                return {
+                    documents,
+                    messages,
+                    userInput,
+                    isThinking,
+                    uploading,
+                    activeDocId,
+                    deletingId,
+                    notice,
+                    messagesContainer,
+                    handleFileUpload,
+                    deleteDocument,
+                    sendMessage,
+                    newChat,
+                    autoResize,
+                    renderMarkdown,
+                    // 访问口令 / 只读模式
+                    gateVisible,
+                    gateInput,
+                    gateError,
+                    gateChecking,
+                    readOnly,
+                    submitGate
+                };
+            }
+        }).mount('#app');
+    </script>
+</body>
+</html>

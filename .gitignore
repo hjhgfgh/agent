@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+# 运行时数据，不进仓库：
+#   documents/   —— 用户上传的 PDF（含个人隐私），且 Docker 里由卷管理
+#   faiss_index/ —— 检索索引，可由已上传的文档随时重建
+#
+# ⚠️ 必须写成 "documents/"（斜杠在末尾）。
+# 之前写的 "documents/*.pdf" 中间带斜杠，会被锚定到仓库根目录，
+# 只能匹配 <根>/documents/*.pdf，而真实路径是 backend/documents/xxx.pdf
+# —— 结果就是上传的 PDF 会全部被提交进仓库。已实测踩中。
+documents/
+faiss_index/
+*.log
+logs/
