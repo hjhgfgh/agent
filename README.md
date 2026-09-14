@@ -381,12 +381,3 @@ MDI 字体只保留了 woff2 一种格式（原包含 eot/woff/ttf 共约 2.4 MB
 本项目要 Vue 3 + ES6 + fetch，能跑起来的浏览器必然支持 woff2。
 
 升级依赖：替换 `frontend/vendor/` 下的文件即可。
-
----
-
-## 十、后续可做
-
-- [ ] 把关键词检索升级为 FAISS 向量检索（`faiss-cpu` 已在依赖里，尚未接入）
-- [ ] WebSocket 流式输出（当前是一次性返回完整回答）
-- [ ] 清理 `requirements.txt` 中未使用的依赖（`faiss-cpu`、`huggingface-hub`、`langchain-openai`）
-- [ ] 索引增量更新，避免每次上传重建
